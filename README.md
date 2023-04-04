@@ -1,4 +1,4 @@
-# Node.js Rest APIs with Express & MySQL example
+# NHL Pipeline Challenge in Node.js & MySQL example
 
 ## Project setup
 
