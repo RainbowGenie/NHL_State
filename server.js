@@ -1,32 +1,39 @@
+const nhl = require("statsapi-nhl");
 const axios = require("axios");
-const connection = require("./models/db.js");
-const mysql = require("mysql");
-const moment = require("moment");
 const Game = require("./models/game.model.js");
 const Player = require("./models/player.model.js");
 
-axios
-  // .get("https://statsapi.web.nhl.com/api/v1/schedule")
-  .get("https://statsapi.web.nhl.com/api/v1/schedule?date=2023-04-03")
-  .then((response) => {
-    const games = response.data.dates[0].games;
+let previousSchedule = null;
 
-    games.forEach((game) => {
-      const gameStatus = game.status.abstractGameState;
-      const gameId = game.gamePk;
+// Poll the NHL Stats API at a regular interval to get real-time schedule data
+setInterval(() => {
+  nhl.Schedule.get()
+    .then((schedule) => {
+      if (JSON.stringify(schedule) !== JSON.stringify(previousSchedule)) {
+        console.log("Schedule has changed:", schedule);
+        previousSchedule = schedule;
+        const games = schedule[0].games;
 
-      if (gameStatus === "Live") {
-        // Start ingestion process for live game
-        ingestLiveGame(gameId);
-      } else if (gameStatus === "Final") {
-        // Reload data for finished game
-        reloadGameData(gameId);
+        games.forEach((game) => {
+          const gameStatus = game.status.abstractGameState;
+          const gameId = game.gamePk;
+
+          if (gameStatus === "Live") {
+            // Start ingestion process for live game
+            ingestLiveGame(gameId);
+          } else if (gameStatus === "Final") {
+            // Reload data for finished game
+            reloadGameData(gameId);
+          }
+        });
+      } else {
+        console.log("Schedule has not changed:");
       }
+    })
+    .catch((error) => {
+      console.error("Error retrieving schedule:", error);
     });
-  })
-  .catch((error) => {
-    console.log(error);
-  });
+}, 5000); // Poll every 5 seconds
 
 function ingestLiveGame(gameId) {
   axios
@@ -65,31 +72,53 @@ function reloadGameData(gameId) {
     .then((response) => {
       const liveData = response.data;
       console.log("gameId", gameId);
+      const statusData = [
+        "",
+        "upcoming",
+        "in_progress",
+        "final",
+        "scheduled",
+        "postponed",
+        "canceled",
+        "suspended",
+      ];
       // Delete old game data from database
-      connection.query(
-        `DELETE FROM game_data WHERE game_id = ${gameId}`,
-        (err) => {
-          if (err) throw err;
-
-          // Get game data from NHL API
+      Game.destroy({
+        where: {
+          game_id: gameId,
+        },
+      })
+        .then(() => {
+          console.log("Game Data deleted successfully");
           try {
-            Game.findOne(gameId, (err, data) => {
-              if (err) {
-                if (err.kind === "not_found") {
-                  const newGame = new Game({
+            Game.findOne({
+              where: {
+                game_id: gameId,
+              },
+            })
+              .then((result) => {
+                if (result === null) {
+                  Game.create({
                     game_id: gameId,
                     home_team_id: liveData.gameData.teams.home.id,
                     home_team_name: liveData.gameData.teams.home.name,
                     away_team_id: liveData.gameData.teams.away.id,
                     away_team_name: liveData.gameData.teams.away.name,
-                    status: liveData.gameData.status.statusCode,
+                    status: statusData[liveData.gameData.status.statusCode],
                     start_time: liveData.gameData.datetime.dateTime,
                     end_time: liveData.gameData.datetime.endDateTime,
-                  });
-                  Game.create(newGame, (err, data) => {});
+                  })
+                    .then((result) => {
+                      console.log(`Created Game Data: ${result.game_id}`);
+                    })
+                    .catch((error) => {
+                      console.error("Error creating Game");
+                    });
                 }
-              }
-            });
+              })
+              .catch((error) => {
+                console.error("Error finding Game");
+              });
           } catch (error) {
             console.error(error);
           }
@@ -115,15 +144,17 @@ function reloadGameData(gameId) {
               liveData.gameData
             );
           }
-        }
-      );
+        })
+        .catch((error) => {
+          console.error(`Error deleting user: ${error}`);
+        });
     })
     .catch((error) => {
       console.log(error);
     });
 }
 async function ingestPlayerData(playerData, gameId, teamData, gameData) {
-  const newPlayer = new Player({
+  Player.create({
     game_id: gameId,
     player_id: playerData.person.id,
     player_name: playerData.person.fullName,
@@ -160,61 +191,77 @@ async function ingestPlayerData(playerData, gameId, teamData, gameData) {
       teamData.id === gameData.teams.away.id
         ? gameData.teams.home.name
         : gameData.teams.away.name,
-  });
-  Player.create(newPlayer, (err, data) => {});
+  })
+    .then((result) => {
+      console.log(
+        `Created Player Data: ${result.player_id} ${result.player_name}`
+      );
+    })
+    .catch((error) => {
+      console.error("Error Creating Player");
+    });
 }
 async function reloadPlayerData(playerData, gameId, teamData, gameData) {
   try {
-    try {
-      Player.findOne(playerData.person.id, (err, data) => {
-        if (err) {
-          if (err.kind === "not_found") {
-            const newPlayer = new Player({
-              game_id: gameId,
-              player_id: playerData.person.id,
-              player_name: playerData.person.fullName,
-              team_id: teamData.id,
-              team_name: teamData.name,
-              age: gameData.players[`ID${playerData.person.id}`].currentAge,
-              number: playerData.jerseyNumber,
-              position: playerData.position.abbreviation,
-              assists:
-                playerData.position.abbreviation === "N/A" ||
-                playerData.position.abbreviation === "G"
-                  ? 0
-                  : playerData.stats.skaterStats.assists,
-              goals:
-                playerData.position.abbreviation === "N/A" ||
-                playerData.position.abbreviation === "G"
-                  ? 0
-                  : playerData.stats.skaterStats.goals,
-              hits:
-                playerData.position.abbreviation === "N/A" ||
-                playerData.position.abbreviation === "G"
-                  ? 0
-                  : playerData.stats.skaterStats.hits,
-              penalty_minutes:
-                playerData.position.abbreviation === "N/A" ||
-                playerData.position.abbreviation === "G"
-                  ? 0
-                  : playerData.stats.skaterStats.penaltyMinutes,
-              opponent_team_id:
-                teamData.id === gameData.teams.away.id
-                  ? gameData.teams.home.id
-                  : gameData.teams.away.id,
-              opponent_team_name:
-                teamData.id === gameData.teams.away.id
-                  ? gameData.teams.home.name
-                  : gameData.teams.away.name,
+    Player.findOne({
+      where: {
+        player_id: playerData.person.id,
+      },
+    })
+      .then((result) => {
+        if (result === null) {
+          Player.create({
+            game_id: gameId,
+            player_id: playerData.person.id,
+            player_name: playerData.person.fullName,
+            team_id: teamData.id,
+            team_name: teamData.name,
+            age: gameData.players[`ID${playerData.person.id}`].currentAge,
+            number: playerData.jerseyNumber,
+            position: playerData.position.abbreviation,
+            assists:
+              playerData.position.abbreviation === "N/A" ||
+              playerData.position.abbreviation === "G"
+                ? 0
+                : playerData.stats.skaterStats.assists,
+            goals:
+              playerData.position.abbreviation === "N/A" ||
+              playerData.position.abbreviation === "G"
+                ? 0
+                : playerData.stats.skaterStats.goals,
+            hits:
+              playerData.position.abbreviation === "N/A" ||
+              playerData.position.abbreviation === "G"
+                ? 0
+                : playerData.stats.skaterStats.hits,
+            penalty_minutes:
+              playerData.position.abbreviation === "N/A" ||
+              playerData.position.abbreviation === "G"
+                ? 0
+                : playerData.stats.skaterStats.penaltyMinutes,
+            opponent_team_id:
+              teamData.id === gameData.teams.away.id
+                ? gameData.teams.home.id
+                : gameData.teams.away.id,
+            opponent_team_name:
+              teamData.id === gameData.teams.away.id
+                ? gameData.teams.home.name
+                : gameData.teams.away.name,
+          })
+            .then((result) => {
+              console.log(
+                `Created Player Data: ${result.player_id} ${result.player_name}`
+              );
+            })
+            .catch((error) => {
+              console.error("Error Creating Player");
             });
-            Player.create(newPlayer, (err, data) => {});
-          }
         }
+      })
+      .catch((error) => {
+        console.error("Error Finding Player");
       });
-    } catch (error) {
-      console.error(error);
-    }
   } catch (error) {
-    console.error(`Error reloading player data for game ${gameId}:`, error);
+    console.error(error);
   }
 }
